@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------
+  # 1) Create the GitHub Release (ONCE)
+  # ------------------------------------------------------------
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+      upload_url: ${{ steps.clean.outputs.upload_url }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+
+    steps:
+      - name: Create release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean upload URL
+        id: clean
+        run: |
+          RAW_URL='${{ steps.release.outputs.upload_url }}'
+          CLEAN_URL="${RAW_URL%\{*}"
+          echo "upload_url=$CLEAN_URL" >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------------
+  # 2) Build binaries and upload assets (SAFE & OVERWRITE)
+  # ------------------------------------------------------------
+  build-and-upload:
+    name: Build & Upload (${{ matrix.target }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          NAME=wp-media-downloader-${{ matrix.target }}
+
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/${{ matrix.target }}/release/wp-media-downloader.exe dist/$NAME.exe
+            echo "ASSET=$NAME.exe" >> $GITHUB_ENV
+          else
+            cp target/${{ matrix.target }}/release/wp-media-downloader dist/$NAME
+            echo "ASSET=$NAME" >> $GITHUB_ENV
+          fi
+
+      - name: Delete existing asset (if any)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSET_NAME="${ASSET}"
+          RELEASE_ID="${{ needs.create-release.outputs.release_id }}"
+
+          ASSET_ID=$(curl -s \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets \
+            | jq -r ".[] | select(.name == \"$ASSET_NAME\") | .id")
+
+          if [[ -n "$ASSET_ID" ]]; then
+            echo "♻️ Deleting existing asset $ASSET_NAME"
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_TOKEN" \
+              https://api.github.com/repos/${{ github.repository }}/releases/assets/$ASSET_ID
+          fi
+
+      - name: Upload asset to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.ref_name }}" dist/${ASSET} --clobber
